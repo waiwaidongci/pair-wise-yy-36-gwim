@@ -1,1 +1,26 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>企业排污许可与超标处置</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem}</style></head><body><h1>企业排污许可与超标处置</h1><p>汇总监测和工况，判断排放超标并跟踪复测、整改、执法与复查</p><p>按浓度与许可限值计算超标倍数，异常读数先进入评估；关闭前必须没有未完成整改项。</p><button onclick="loadItems()">刷新列表</button><pre id="out">使用X-Actor和X-Role请求头调用接口。</pre><script>async function loadItems(){const r=await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>企业排污许可与超标处置</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem;margin-right:.5rem}input{padding:.5rem;margin-right:.5rem}</style></head>
+<body><h1>企业排污许可与超标处置</h1>
+<p>汇总监测和工况，判断排放超标并跟踪复测、整改、执法与复查</p>
+<p>按浓度与许可限值计算超标倍数，异常读数先进入评估；关闭前必须没有未完成整改项。</p>
+<button onclick="loadItems()">刷新列表</button>
+<button onclick="loadAudit('director')">主管看全链</button>
+<button onclick="loadAudit('operator')">运行人员看本人</button>
+<hr>
+<input id="reqId" value="REQ-DEMO-1" placeholder="封存请求编号">
+<button onclick="seal()">合规员封存</button>
+<button onclick="verify()">主管核验</button>
+<pre id="out">使用X-Actor和X-Role请求头调用接口。</pre>
+<script>
+const out=document.getElementById('out');
+function show(r){r.json().then(j=>out.textContent=(r.ok?'':'HTTP '+r.status+'\n')+JSON.stringify(j,null,2));}
+async function loadItems(){show(await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}}));}
+async function loadAudit(role){show(await fetch('/api/audit',{headers:{'X-Actor':'demo','X-Role':role}}));}
+async function seal(){
+  const r=await fetch('/api/audit/seals',{method:'POST',headers:{'Content-Type':'application/json','X-Actor':'officer-1','X-Role':'compliance_officer'},body:JSON.stringify({request_id:document.getElementById('reqId').value})});
+  show(r);
+}
+async function verify(){
+  const r=await fetch('/api/audit/verify',{method:'POST',headers:{'Content-Type':'application/json','X-Actor':'chief','X-Role':'director'},body:JSON.stringify({request_id:document.getElementById('reqId').value})});
+  show(r);
+}
+</script></body></html>

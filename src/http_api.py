@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from .domain import (ConflictError, DomainError, NotFoundError, PermissionDenied,
-                     ValidationError)
+                     ValidationError, VerificationConflict)
 from .service import Service
 
 
@@ -57,7 +57,9 @@ def make_handler(service: Service, static_dir: str):
             return value
 
         def _send_error(self, exc: Exception) -> None:
-            if isinstance(exc, ValidationError):
+            if isinstance(exc, VerificationConflict):
+                status = 409
+            elif isinstance(exc, ValidationError):
                 status = 422
             elif isinstance(exc, NotFoundError):
                 status = 404
@@ -71,7 +73,11 @@ def make_handler(service: Service, static_dir: str):
                 status = 400
             else:
                 status = 500
-            self._json(status, {"error": exc.__class__.__name__, "message": str(exc)})
+            payload = {"error": exc.__class__.__name__, "message": str(exc)}
+            extra = getattr(exc, "extra", None)
+            if extra:
+                payload.update(extra)
+            self._json(status, payload)
 
         def do_GET(self) -> None:
             try:
@@ -96,8 +102,11 @@ def make_handler(service: Service, static_dir: str):
                     self._json(200, service.get_item(item_id, role))
                 elif path == "/api/audit":
                     actor, role = self._identity()
-                    del actor
-                    self._json(200, {"events": service.audit(role)})
+                    self._json(200, {"events": service.audit(role, actor=actor)})
+                elif path == "/api/audit/seals":
+                    self._json(405, {"error": "method_not_allowed"})
+                elif path == "/api/audit/verify":
+                    self._json(405, {"error": "method_not_allowed"})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -119,6 +128,10 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path == "/api/audit/seals":
+                    self._json(201, service.seal_audit(body, actor, role))
+                elif path == "/api/audit/verify":
+                    self._json(200, service.verify_audit(body, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

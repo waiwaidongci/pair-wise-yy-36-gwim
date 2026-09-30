@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .audit import make_entry, utc_now
+from .audit import calculate_hash, make_entry, utc_now
 from .domain import ConflictError, NotFoundError
 from .rules import ID_PREFIX, STATES
 
@@ -64,6 +64,13 @@ class Repository:
                     previous_hash TEXT NOT NULL,
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS audit_seals (
+                    request_id TEXT PRIMARY KEY,
+                    tail_event_id INTEGER NOT NULL,
+                    tail_hash TEXT NOT NULL,
+                    sealed_by TEXT NOT NULL,
+                    sealed_at TEXT NOT NULL
                 );
             """)
 
@@ -176,21 +183,92 @@ class Repository:
         event["id"] = event_id
         return event
 
-    def list_audit(self, entity_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def list_audit(self, entity_id: Optional[int] = None,
+                   actor: Optional[str] = None) -> List[Dict[str, Any]]:
         sql = "SELECT * FROM audit_events"
-        params: tuple = ()
+        clauses = []
+        params: List[Any] = []
         if entity_id is not None:
-            sql += " WHERE entity_id=?"
-            params = (entity_id,)
+            clauses.append("entity_id=?")
+            params.append(entity_id)
+        if actor is not None:
+            clauses.append("actor=?")
+            params.append(actor)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY id"
         with self._lock:
-            rows = self.conn.execute(sql, params).fetchall()
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
         result = []
         for row in rows:
             item = dict(row)
             item["detail"] = json.loads(item["detail"])
             result.append(item)
         return result
+
+    def get_seal(self, request_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM audit_seals WHERE request_id=?", (request_id,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def seal_audit_chain(self, request_id: str, actor: str) -> Dict[str, Any]:
+        """按请求编号封存当前审计链。
+
+        封存事件、凭据与请求编号在同一事务内提交：任何一步失败整体回滚，
+        不留半条记录。重复请求编号返回首次封存结果。
+        """
+        sealed_at = utc_now()
+        with self._lock:
+            existing = self.conn.execute(
+                "SELECT * FROM audit_seals WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
+            try:
+                with self.conn:  # 提交或回滚均在进程锁保护下完成
+                    row = self.conn.execute(
+                        "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                    previous = row["entry_hash"] if row else "GENESIS"
+                    event = make_entry("seal", "audit_chain", 0, actor, {
+                        "request_id": request_id,
+                        "previous_tail_hash": previous,
+                    }, previous, created_at=sealed_at)
+                    cur = self.conn.execute(
+                        """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
+                           previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                        (event["action"], event["entity_type"], event["entity_id"], event["actor"],
+                         json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
+                         event["previous_hash"], event["entry_hash"], event["created_at"]),
+                    )
+                    tail_event_id = int(cur.lastrowid)
+                    self._insert_seal(request_id, tail_event_id,
+                                      event["entry_hash"], actor, sealed_at)
+            except sqlite3.IntegrityError:
+                # 并发情况下另一个线程已写入同一请求编号：返回首次结果
+                row = self.conn.execute(
+                    "SELECT * FROM audit_seals WHERE request_id=?", (request_id,)
+                ).fetchone()
+                if row is not None:
+                    return dict(row)
+                raise
+        return {
+            "request_id": request_id,
+            "tail_event_id": tail_event_id,
+            "tail_hash": event["entry_hash"],
+            "sealed_by": actor,
+            "sealed_at": sealed_at,
+        }
+
+    def _insert_seal(self, request_id: str, tail_event_id: int, tail_hash: str,
+                     actor: str, sealed_at: str) -> None:
+        self.conn.execute(
+            """INSERT INTO audit_seals(request_id, tail_event_id, tail_hash,
+               sealed_by, sealed_at) VALUES(?,?,?,?,?)""",
+            (request_id, tail_event_id, tail_hash, actor, sealed_at),
+        )
 
     def verify_audit_chain(self) -> bool:
         from .audit import calculate_hash
