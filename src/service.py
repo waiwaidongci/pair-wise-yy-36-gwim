@@ -4,10 +4,10 @@ from typing import Any, Dict, Optional
 
 from .domain import ensure_role, normalize_severity, require_number, require_text
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
-                    validate_transition)
+from .rules import (AUDIT_READ_ALL_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES,
+                    SEAL_ROLES, TITLE, VERIFY_ROLES, VIEW_ROLES, completion_blockers,
+                    escalation_required, priority_score, response_deadline_hours,
+                    role_for_transition, validate_transition)
 
 
 class Service:
@@ -87,9 +87,27 @@ class Service:
         self._view(role)
         return self.repository.list_records(item_id)
 
-    def audit(self, role: str, item_id: Optional[int] = None) -> list:
-        ensure_role(role, AUDIT_ROLES)
-        return self.repository.list_audit(item_id)
+    def audit(self, role: str, item_id: Optional[int] = None,
+              actor: Optional[str] = None) -> list:
+        if role in AUDIT_READ_ALL_ROLES:
+            return self.repository.list_audit(item_id)
+        if actor:
+            return self.repository.list_audit(item_id, actor=actor)
+        return []
+
+    def seal_chain(self, payload: Dict[str, Any], actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, SEAL_ROLES)
+        actor = require_text(actor, "actor", 100)
+        request_no = require_text(payload.get("request_no"), "request_no", 100)
+        return self.repository.create_seal(request_no, actor)
+
+    def verify_chain(self, role: str, request_no: Optional[str] = None) -> Dict[str, Any]:
+        ensure_role(role, VERIFY_ROLES)
+        return self.repository.verify_seal(request_no)
+
+    def list_seals(self, role: str) -> list:
+        ensure_role(role, VERIFY_ROLES)
+        return self.repository.list_seals()
 
     @staticmethod
     def enrich(item: Dict[str, Any]) -> Dict[str, Any]:

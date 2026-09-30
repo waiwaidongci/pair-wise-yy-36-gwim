@@ -96,8 +96,16 @@ def make_handler(service: Service, static_dir: str):
                     self._json(200, service.get_item(item_id, role))
                 elif path == "/api/audit":
                     actor, role = self._identity()
+                    self._json(200, {"events": service.audit(role, actor=actor)})
+                elif path == "/api/audit/seals":
+                    actor, role = self._identity()
                     del actor
-                    self._json(200, {"events": service.audit(role)})
+                    self._json(200, {"seals": service.list_seals(role)})
+                elif path == "/api/audit/verify":
+                    actor, role = self._identity()
+                    del actor
+                    request_no = parse_qs(urlparse(self.path).query).get("request_no", [None])[0]
+                    self._json(200, service.verify_chain(role, request_no))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -119,6 +127,8 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path == "/api/audit/seal":
+                    self._json(201, service.seal_chain(body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

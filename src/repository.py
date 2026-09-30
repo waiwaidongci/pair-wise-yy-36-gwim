@@ -65,6 +65,15 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS audit_seals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_no TEXT NOT NULL UNIQUE,
+                    tail_event_id INTEGER NOT NULL,
+                    tail_hash TEXT NOT NULL,
+                    event_count INTEGER NOT NULL,
+                    sealed_by TEXT NOT NULL,
+                    sealed_at TEXT NOT NULL
+                );
             """)
 
     @staticmethod
@@ -176,12 +185,19 @@ class Repository:
         event["id"] = event_id
         return event
 
-    def list_audit(self, entity_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def list_audit(self, entity_id: Optional[int] = None,
+                   actor: Optional[str] = None) -> List[Dict[str, Any]]:
         sql = "SELECT * FROM audit_events"
-        params: tuple = ()
+        params: list = []
+        conditions: list = []
         if entity_id is not None:
-            sql += " WHERE entity_id=?"
-            params = (entity_id,)
+            conditions.append("entity_id=?")
+            params.append(entity_id)
+        if actor is not None:
+            conditions.append("actor=?")
+            params.append(actor)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY id"
         with self._lock:
             rows = self.conn.execute(sql, params).fetchall()
@@ -209,6 +225,175 @@ class Repository:
                 return False
             previous = row["entry_hash"]
         return True
+
+    @staticmethod
+    def _seal_row(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "request_no": row["request_no"],
+            "tail_event_id": row["tail_event_id"],
+            "tail_hash": row["tail_hash"],
+            "event_count": row["event_count"],
+            "sealed_by": row["sealed_by"],
+            "sealed_at": row["sealed_at"],
+        }
+
+    def create_seal(self, request_no: str, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            existing = self.conn.execute(
+                "SELECT * FROM audit_seals WHERE request_no=?", (request_no,)
+            ).fetchone()
+            if existing is not None:
+                return self._seal_row(existing)
+            tail = self.conn.execute(
+                "SELECT id, entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if tail is None:
+                tail_event_id = 0
+                tail_hash = "GENESIS"
+            else:
+                tail_event_id = int(tail["id"])
+                tail_hash = tail["entry_hash"]
+            event_count = int(self.conn.execute(
+                "SELECT COUNT(*) AS n FROM audit_events"
+            ).fetchone()["n"])
+            try:
+                cur = self.conn.execute(
+                    """INSERT INTO audit_seals(request_no, tail_event_id, tail_hash,
+                       event_count, sealed_by, sealed_at) VALUES(?,?,?,?,?,?)""",
+                    (request_no, tail_event_id, tail_hash, event_count, actor, now),
+                )
+                seal_id = int(cur.lastrowid)
+            except sqlite3.IntegrityError:
+                winner = self.conn.execute(
+                    "SELECT * FROM audit_seals WHERE request_no=?", (request_no,)
+                ).fetchone()
+                return self._seal_row(winner)
+            event = make_entry(
+                "seal", "audit_chain", seal_id, actor,
+                {"request_no": request_no, "tail_event_id": tail_event_id,
+                 "tail_hash": tail_hash},
+                tail_hash,
+            )
+            self.conn.execute(
+                """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
+                   previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                (event["action"], event["entity_type"], event["entity_id"], event["actor"],
+                 json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
+                 event["previous_hash"], event["entry_hash"], event["created_at"]),
+            )
+        return self.get_seal_by_id(seal_id)
+
+    def get_seal_by_id(self, seal_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM audit_seals WHERE id=?", (seal_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("封存凭据不存在")
+        return self._seal_row(row)
+
+    def get_seal(self, request_no: str) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM audit_seals WHERE request_no=?", (request_no,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("封存凭据不存在")
+        return self._seal_row(row)
+
+    def list_seals(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute("SELECT * FROM audit_seals ORDER BY id").fetchall()
+        return [self._seal_row(row) for row in rows]
+
+    def verify_seal(self, request_no: Optional[str] = None) -> Dict[str, Any]:
+        from .audit import calculate_hash
+        with self._lock:
+            rows = self.conn.execute("SELECT * FROM audit_events ORDER BY id").fetchall()
+            events: List[Dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                item["detail"] = json.loads(item["detail"])
+                events.append(item)
+
+            chain_valid = True
+            breakpoint: Optional[Dict[str, Any]] = None
+            previous = "GENESIS"
+            for event in events:
+                if event["previous_hash"] != previous:
+                    chain_valid = False
+                    breakpoint = {
+                        "event_id": event["id"],
+                        "reason": "previous_hash_mismatch",
+                        "expected_hash": previous,
+                        "actual_hash": event["previous_hash"],
+                    }
+                    break
+                payload = {
+                    "action": event["action"], "entity_type": event["entity_type"],
+                    "entity_id": event["entity_id"], "actor": event["actor"],
+                    "detail": event["detail"], "created_at": event["created_at"],
+                }
+                calculated = calculate_hash(previous, payload)
+                if calculated != event["entry_hash"]:
+                    chain_valid = False
+                    breakpoint = {
+                        "event_id": event["id"],
+                        "reason": "hash_mismatch",
+                        "expected_hash": calculated,
+                        "actual_hash": event["entry_hash"],
+                    }
+                    break
+                previous = event["entry_hash"]
+
+            if request_no is not None:
+                seal_row = self.conn.execute(
+                    "SELECT * FROM audit_seals WHERE request_no=?", (request_no,)
+                ).fetchone()
+            else:
+                seal_row = self.conn.execute(
+                    "SELECT * FROM audit_seals ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            seal = self._seal_row(seal_row) if seal_row is not None else None
+
+            seal_valid = True
+            lag: Optional[int] = None
+            if seal is not None:
+                tail_event = next(
+                    (e for e in events if e["id"] == seal["tail_event_id"]), None
+                )
+                if tail_event is None:
+                    seal_valid = False
+                    if breakpoint is None:
+                        breakpoint = {
+                            "event_id": seal["tail_event_id"],
+                            "reason": "seal_tail_missing",
+                            "expected_hash": seal["tail_hash"],
+                            "actual_hash": None,
+                        }
+                elif tail_event["entry_hash"] != seal["tail_hash"]:
+                    seal_valid = False
+                    if breakpoint is None:
+                        breakpoint = {
+                            "event_id": seal["tail_event_id"],
+                            "reason": "seal_tail_hash_mismatch",
+                            "expected_hash": seal["tail_hash"],
+                            "actual_hash": tail_event["entry_hash"],
+                        }
+                else:
+                    lag = sum(1 for e in events if e["id"] > seal["tail_event_id"])
+
+        return {
+            "valid": chain_valid and seal_valid,
+            "chain_valid": chain_valid,
+            "seal_valid": seal_valid,
+            "seal": seal,
+            "lag": lag,
+            "breakpoint": breakpoint,
+            "total_events": len(events),
+        }
 
     def close(self) -> None:
         with self._lock:
